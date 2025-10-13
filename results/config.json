@@ -1,0 +1,14 @@
+{
+    "SEED": 42,
+    "EMBEDDING_DIM": 200,
+    "TEMPORAL_DIM": 50,
+    "EMOTION_DIM": 50,
+    "OMNIVEC_EPOCHS": 15,
+    "BATCH_SIZE": 128,
+    "LEARNING_RATE": 0.001,
+    "ALPHA_EMOTION": 0.3,
+    "ALPHA_TEMPORAL": 0.2,
+    "ALPHA_MULTIMODAL": 0.25,
+    "ALPHA_CAUSAL": 0.15,
+    "ALPHA_BASE": 1.0
+}
