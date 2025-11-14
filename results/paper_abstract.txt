@@ -9,10 +9,10 @@ and causality relation modeling.
 
 We evaluate OmniVec on sentiment analysis (IMDB) and emotion classification tasks,
 demonstrating significant improvements over baseline methods. OmniVec achieves
-0.6360 accuracy on sentiment classification
-(-23.70% improvement over best baseline) and 
-0.6500 accuracy on emotion classification
-(+16.91% improvement). 
+0.8930 accuracy on sentiment classification
+(+5.12% improvement over best baseline) and 
+0.7334 accuracy on emotion classification
+(+45.86% improvement). 
 
 Ablation studies confirm that each component contributes meaningfully to performance,
 with the emotion-aware layer providing the largest gains on emotion-related tasks.

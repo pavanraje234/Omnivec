@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-OmniVec Part 5: Training and Comprehensive Evaluation
-Train OmniVec and compare with all baselines
+OmniVec Part 5 (UPDATED): Training and Comprehensive Evaluation
+Fixes:
+ - pass imdb_data into OmniVecDataset (so sentiment samples are included)
+ - move batch tensors to device and include sentiment labels in batch_data
+ - use AdamW optimizer and maintain training history per-component
+ - optional quick-eval hook to run quick validation each epoch (disabled by default)
 """
 
 import os
@@ -25,8 +29,12 @@ from omnivec_part3 import get_sentence_embedding, evaluate_sentiment_classificat
 from omnivec_part4 import OmniVecModel, OmniVecLoss, OmniVecDataset
 from torch.utils.data import DataLoader
 
-# ============================================================================
-# OmniVec Embeddings Wrapper
+# Use AdamW if available (preferred)
+try:
+    from torch.optim import AdamW
+except:
+    AdamW = optim.Adam
+
 # ============================================================================
 
 class OmniVecEmbeddings:
@@ -56,19 +64,20 @@ class OmniVecEmbeddings:
             return 0.0
         v1 = self[word1]
         v2 = self[word2]
+        # avoid numerical issues
+        if np.all(v1 == 0) or np.all(v2 == 0):
+            return 0.0
         return 1 - cosine(v1, v2)
 
 # ============================================================================
-# Training Loop
-# ============================================================================
 
-def train_omnivec(model, train_loader, criterion, config, num_epochs=None):
-    """Train OmniVec model with multi-task objectives"""
+def train_omnivec(model, train_loader, criterion, config, num_epochs=None, quick_eval=False, eval_every=1, imdb_data=None, emotion_data=None, vocab_to_idx=None):
+    """Train OmniVec model with multi-task objectives (fixed)"""
     
     if num_epochs is None:
         num_epochs = config.OMNIVEC_EPOCHS
     
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    optimizer = AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=0.01)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
     
     print("\n" + "="*70)
@@ -95,71 +104,109 @@ def train_omnivec(model, train_loader, criterion, config, num_epochs=None):
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            # Move to device
+            # Move tensors to device and prepare batch_data
             token_indices = batch['token_indices'].to(config.DEVICE)
-            has_emotion = batch['has_emotion']
-            emotion_labels = batch['emotion_label'].to(config.DEVICE)
             
-            # Sample target (center word for skip-gram)
-            targets = token_indices[:, token_indices.size(1)//2]
+            # Masks and labels: move to device if present
+            has_sentiment = batch.get('has_sentiment', torch.zeros(token_indices.size(0), dtype=torch.bool))
+            has_emotion = batch.get('has_emotion', torch.zeros(token_indices.size(0), dtype=torch.bool))
+            has_causality = batch.get('has_causality', torch.zeros(token_indices.size(0), dtype=torch.bool))
+            
+            # Move masks and labels to device
+            has_sentiment = has_sentiment.to(config.DEVICE)
+            has_emotion = has_emotion.to(config.DEVICE)
+            has_causality = has_causality.to(config.DEVICE)
+            
+            sentiment_labels = batch.get('sentiment_label', torch.full((token_indices.size(0),), -1, dtype=torch.long)).to(config.DEVICE)
+            emotion_labels = batch.get('emotion_label', torch.full((token_indices.size(0),), -1, dtype=torch.long)).to(config.DEVICE)
+            cause_idx = batch.get('cause_idx', torch.zeros((token_indices.size(0),), dtype=torch.long)).to(config.DEVICE)
+            effect_idx = batch.get('effect_idx', torch.zeros((token_indices.size(0),), dtype=torch.long)).to(config.DEVICE)
+            
+            # Targets (not used by current loss but kept for compatibility)
+            targets = token_indices[:, token_indices.size(1)//2].to(config.DEVICE)
             
             # Forward pass
             outputs = model(token_indices, time_idx=epoch % 10)
             
-            # Compute loss
+            # Build batch_data dict for the loss module
             batch_data = {
+                'has_sentiment': has_sentiment,
+                'sentiment_label': sentiment_labels,
                 'has_emotion': has_emotion,
                 'emotion_label': emotion_labels,
+                'has_causality': has_causality,
+                'cause_idx': cause_idx,
+                'effect_idx': effect_idx
             }
             
+            # Compute loss
             losses = criterion(outputs, targets, batch_data)
+            total_loss = losses.get('total', torch.tensor(0.0, device=config.DEVICE))
             
             # Backward pass
             optimizer.zero_grad()
-            losses['total'].backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             
-            # Track losses
-            for key, value in losses.items():
-                epoch_losses[key] += value.item()
+            # Track losses (convert tensors to scalars safely)
+            for key, val in losses.items():
+                try:
+                    epoch_losses[key] += float(val.item())
+                except:
+                    # fallback for non-tensor
+                    epoch_losses[key] += float(val)
             num_batches += 1
             
-            # Update progress bar
+            # Update progress bar occasionally
             if batch_idx % 10 == 0:
                 progress_bar.set_postfix({
-                    'loss': f"{losses['total'].item():.4f}",
-                    'sg': f"{losses.get('skipgram', torch.tensor(0)).item():.4f}",
-                    'emo': f"{losses.get('emotion', torch.tensor(0)).item():.4f}"
+                    'loss': f"{float(total_loss.item()):.4f}",
+                    'emo': f"{float(losses.get('emotion', torch.tensor(0.0)).item()):.4f}" if 'emotion' in losses else "0.0000",
+                    'sent': f"{float(losses.get('sentiment', torch.tensor(0.0)).item()):.4f}" if 'sentiment' in losses else "0.0000"
                 })
         
         # Average losses
-        avg_loss = epoch_losses['total'] / num_batches
+        if num_batches == 0:
+            avg_loss = 0.0
+        else:
+            avg_loss = epoch_losses['total'] / num_batches
+        
         training_history['epoch_losses'].append(avg_loss)
-        
         for key in epoch_losses:
-            training_history['component_losses'][key].append(epoch_losses[key] / num_batches)
+            training_history['component_losses'][key].append(epoch_losses[key] / max(1, num_batches))
         
-        # Learning rate scheduling
-        scheduler.step(avg_loss)
+        # Scheduler step (ReduceLROnPlateau expects a scalar)
+        try:
+            scheduler.step(avg_loss)
+        except Exception:
+            pass
         
-        # Print epoch summary
+        # Epoch summary
         print(f"Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.4f}")
-        if 'skipgram' in epoch_losses:
-            print(f"  Skip-gram: {epoch_losses['skipgram']/num_batches:.4f}")
-        if 'emotion' in epoch_losses:
-            print(f"  Emotion: {epoch_losses['emotion']/num_batches:.4f}")
-        if 'temporal' in epoch_losses:
-            print(f"  Temporal: {epoch_losses['temporal']/num_batches:.4f}")
+        for comp in ['sentiment', 'emotion', 'regularization', 'skipgram', 'causal']:
+            if comp in epoch_losses:
+                print(f"  {comp}: {epoch_losses[comp]/num_batches:.4f}")
+        
+        # Optional quick evaluation for debugging (disabled by default)
+        if quick_eval and ((epoch + 1) % eval_every == 0):
+            print("Running quick evaluation (debug)...")
+            model.eval()
+            try:
+                emb_wrapper = OmniVecEmbeddings(model, vocab_to_idx) if 'vocab_to_idx' in locals() else None
+                if emb_wrapper is not None and imdb_data is not None:
+                    sent_res = evaluate_sentiment_classification(emb_wrapper, imdb_data, f"OmniVec_epoch{epoch+1}", config)
+                    emo_res = evaluate_emotion_classification(emb_wrapper, emotion_data, f"OmniVec_epoch{epoch+1}", config)
+                    print("Quick Eval - Sentiment Acc:", sent_res['accuracy'], "Emotion Acc:", emo_res['accuracy'])
+            except Exception as e:
+                print("Quick eval failed:", e)
+            model.train()
     
     training_time = time.time() - start_time
-    
     print(f"\n✓ Training completed in {training_time:.2f}s ({training_time/60:.2f} minutes)")
     
     return model, training_history, training_time
 
-# ============================================================================
-# Statistical Significance Testing
 # ============================================================================
 
 def bootstrap_test(baseline_score, omnivec_score, n_bootstrap=1000):
@@ -169,21 +216,21 @@ def bootstrap_test(baseline_score, omnivec_score, n_bootstrap=1000):
     omnivec_samples = np.random.normal(omnivec_score, 0.01, n_bootstrap)
     
     t_stat, p_value = ttest_rel(omnivec_samples, baseline_samples)
-    
     return t_stat, p_value
 
 # ============================================================================
-# Main Execution
-# ============================================================================
 
 def main():
-    """Main training and evaluation function"""
+    """Main training and evaluation function (fixed)"""
     print("\n" + "="*70)
-    print("OMNIVEC PROJECT - PART 5: TRAINING & EVALUATION")
+    print("OMNIVEC PROJECT - PART 5: TRAINING & EVALUATION (UPDATED)")
     print("="*70)
     
     # Initialize config
     config = OmniVecConfig()
+    # For quick debugging you can override:
+    # config.CORPUS_LIMIT = 2000
+    # config.OMNIVEC_EPOCHS = 2
     config.set_seed()
     
     # Load preprocessed data
@@ -205,12 +252,13 @@ def main():
     
     print("✓ Data loaded successfully")
     
-    # Create dataset and dataloader
+    # Create dataset and dataloader (note: OmniVecDataset signature expects imdb_data)
     print("\nCreating dataset and dataloader...")
     omnivec_dataset = OmniVecDataset(
         unified_corpus,
         emotion_data,
         causality_data,
+        imdb_data,         # <--- pass imdb_data here
         vocab_to_idx,
         config
     )
@@ -219,7 +267,8 @@ def main():
         omnivec_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
-        num_workers=0
+        num_workers=0,
+        pin_memory=True if torch.cuda.is_available() else False
     )
     
     print(f"✓ Dataset ready: {len(omnivec_dataset)} samples, {len(train_loader)} batches")
@@ -234,10 +283,15 @@ def main():
     
     # Train model
     omnivec_model, training_history, omnivec_training_time = train_omnivec(
-        omnivec_model, 
-        train_loader, 
-        criterion, 
-        config
+        omnivec_model,
+        train_loader,
+        criterion,
+        config,
+        quick_eval=False,      # set True for debug eval each epoch (slower)
+        eval_every=1,
+        imdb_data=imdb_data,
+        emotion_data=emotion_data,
+        vocab_to_idx=vocab_to_idx
     )
     
     # Save trained model
@@ -270,107 +324,88 @@ def main():
     # Save OmniVec results
     save_results(omnivec_results, 'omnivec_results.json', config.RESULTS_DIR)
     
-    # Load baseline results for comparison
-    with open(os.path.join(config.RESULTS_DIR, 'baseline_results.json'), 'r') as f:
-        baseline_results = json.load(f)
+    # Load baseline results for comparison (safe guard)
+    baseline_results = {}
+    baseline_path = os.path.join(config.RESULTS_DIR, 'baseline_results.json')
+    if os.path.exists(baseline_path):
+        with open(baseline_path, 'r') as f:
+            baseline_results = json.load(f)
+    else:
+        print("Warning: baseline_results.json not found; skipping baseline comparison.")
     
-    # Create comprehensive comparison
-    print("\n" + "="*70)
-    print("COMPREHENSIVE RESULTS COMPARISON")
-    print("="*70)
+    # Create comprehensive comparison only if we have baseline results
+    if baseline_results:
+        comparison_data = {
+            'Model': ['Word2Vec CBOW', 'Word2Vec Skip-gram', 'FastText', 'OmniVec (Ours)'],
+            'Sentiment Accuracy': [
+                baseline_results['word2vec_cbow']['sentiment']['accuracy'],
+                baseline_results['word2vec_skipgram']['sentiment']['accuracy'],
+                baseline_results['fasttext']['sentiment']['accuracy'],
+                omnivec_results['sentiment']['accuracy']
+            ],
+            'Sentiment F1': [
+                baseline_results['word2vec_cbow']['sentiment']['f1'],
+                baseline_results['word2vec_skipgram']['sentiment']['f1'],
+                baseline_results['fasttext']['sentiment']['f1'],
+                omnivec_results['sentiment']['f1']
+            ],
+            'Sentiment AUC': [
+                baseline_results['word2vec_cbow']['sentiment'].get('auc', None),
+                baseline_results['word2vec_skipgram']['sentiment'].get('auc', None),
+                baseline_results['fasttext']['sentiment'].get('auc', None),
+                omnivec_results['sentiment'].get('auc', None)
+            ],
+            'Emotion Accuracy': [
+                baseline_results['word2vec_cbow']['emotion']['accuracy'],
+                baseline_results['word2vec_skipgram']['emotion']['accuracy'],
+                baseline_results['fasttext']['emotion']['accuracy'],
+                omnivec_results['emotion']['accuracy']
+            ],
+            'Emotion F1': [
+                baseline_results['word2vec_cbow']['emotion']['f1'],
+                baseline_results['word2vec_skipgram']['emotion']['f1'],
+                baseline_results['fasttext']['emotion']['f1'],
+                omnivec_results['emotion']['f1']
+            ]
+        }
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        
+        print("\n" + "="*70)
+        print("FINAL RESULTS TABLE")
+        print("="*70)
+        print(comparison_df.to_string(index=False))
+        print()
+        
+        # Save comprehensive results
+        comparison_df.to_csv(os.path.join(config.RESULTS_DIR, 'comprehensive_comparison.csv'), index=False)
+        
+        # Statistical significance testing (bootstrap)
+        best_baseline_sentiment_acc = max(comparison_data['Sentiment Accuracy'][:3])
+        best_baseline_emotion_acc = max(comparison_data['Emotion Accuracy'][:3])
+        omnivec_sentiment_acc = comparison_data['Sentiment Accuracy'][3]
+        omnivec_emotion_acc = comparison_data['Emotion Accuracy'][3]
+        
+        t_sent, p_sent = bootstrap_test(best_baseline_sentiment_acc, omnivec_sentiment_acc)
+        t_emo, p_emo = bootstrap_test(best_baseline_emotion_acc, omnivec_emotion_acc)
+        
+        print("="*70)
+        print("IMPROVEMENT & SIGNIFICANCE")
+        print("="*70)
+        print(f"Sentiment Accuracy: t={t_sent:.3f}, p={p_sent:.4f}")
+        print(f"Emotion Accuracy:   t={t_emo:.3f}, p={p_emo:.4f}")
     
-    comparison_data = {
-        'Model': ['Word2Vec CBOW', 'Word2Vec Skip-gram', 'FastText', 'OmniVec (Ours)'],
-        'Sentiment Accuracy': [
-            baseline_results['word2vec_cbow']['sentiment']['accuracy'],
-            baseline_results['word2vec_skipgram']['sentiment']['accuracy'],
-            baseline_results['fasttext']['sentiment']['accuracy'],
-            omnivec_results['sentiment']['accuracy']
-        ],
-        'Sentiment F1': [
-            baseline_results['word2vec_cbow']['sentiment']['f1'],
-            baseline_results['word2vec_skipgram']['sentiment']['f1'],
-            baseline_results['fasttext']['sentiment']['f1'],
-            omnivec_results['sentiment']['f1']
-        ],
-        'Sentiment AUC': [
-            baseline_results['word2vec_cbow']['sentiment']['auc'],
-            baseline_results['word2vec_skipgram']['sentiment']['auc'],
-            baseline_results['fasttext']['sentiment']['auc'],
-            omnivec_results['sentiment']['auc']
-        ],
-        'Emotion Accuracy': [
-            baseline_results['word2vec_cbow']['emotion']['accuracy'],
-            baseline_results['word2vec_skipgram']['emotion']['accuracy'],
-            baseline_results['fasttext']['emotion']['accuracy'],
-            omnivec_results['emotion']['accuracy']
-        ],
-        'Emotion F1': [
-            baseline_results['word2vec_cbow']['emotion']['f1'],
-            baseline_results['word2vec_skipgram']['emotion']['f1'],
-            baseline_results['fasttext']['emotion']['f1'],
-            omnivec_results['emotion']['f1']
-        ]
-    }
-    
-    comparison_df = pd.DataFrame(comparison_data)
-    
-    print("\n" + "="*70)
-    print("FINAL RESULTS TABLE")
-    print("="*70)
-    print(comparison_df.to_string(index=False))
-    print()
-    
-    # Calculate improvements
-    best_baseline_sentiment_acc = max(comparison_data['Sentiment Accuracy'][:3])
-    best_baseline_sentiment_f1 = max(comparison_data['Sentiment F1'][:3])
-    best_baseline_emotion_acc = max(comparison_data['Emotion Accuracy'][:3])
-    best_baseline_emotion_f1 = max(comparison_data['Emotion F1'][:3])
-    
-    omnivec_sentiment_acc = comparison_data['Sentiment Accuracy'][3]
-    omnivec_sentiment_f1 = comparison_data['Sentiment F1'][3]
-    omnivec_emotion_acc = comparison_data['Emotion Accuracy'][3]
-    omnivec_emotion_f1 = comparison_data['Emotion F1'][3]
-    
-    improvement_sentiment_acc = ((omnivec_sentiment_acc - best_baseline_sentiment_acc) / best_baseline_sentiment_acc) * 100
-    improvement_sentiment_f1 = ((omnivec_sentiment_f1 - best_baseline_sentiment_f1) / best_baseline_sentiment_f1) * 100
-    improvement_emotion_acc = ((omnivec_emotion_acc - best_baseline_emotion_acc) / best_baseline_emotion_acc) * 100
-    improvement_emotion_f1 = ((omnivec_emotion_f1 - best_baseline_emotion_f1) / best_baseline_emotion_f1) * 100
-    
-    print("="*70)
-    print("IMPROVEMENT OVER BEST BASELINE")
-    print("="*70)
-    print(f"Sentiment Accuracy: {improvement_sentiment_acc:+.2f}%")
-    print(f"Sentiment F1:       {improvement_sentiment_f1:+.2f}%")
-    print(f"Emotion Accuracy:   {improvement_emotion_acc:+.2f}%")
-    print(f"Emotion F1:         {improvement_emotion_f1:+.2f}%")
-    print()
-    
-    # Save comprehensive results
-    comparison_df.to_csv(os.path.join(config.RESULTS_DIR, 'comprehensive_comparison.csv'), index=False)
-    
-    # Statistical significance testing
-    print("="*70)
-    print("STATISTICAL SIGNIFICANCE TESTING")
-    print("="*70)
-    
-    t_sent, p_sent = bootstrap_test(best_baseline_sentiment_acc, omnivec_sentiment_acc)
-    print(f"Sentiment Accuracy: t={t_sent:.3f}, p={p_sent:.4f} {'***' if p_sent < 0.001 else '**' if p_sent < 0.01 else '*' if p_sent < 0.05 else 'ns'}")
-    
-    t_emo, p_emo = bootstrap_test(best_baseline_emotion_acc, omnivec_emotion_acc)
-    print(f"Emotion Accuracy:   t={t_emo:.3f}, p={p_emo:.4f} {'***' if p_emo < 0.001 else '**' if p_emo < 0.01 else '*' if p_emo < 0.05 else 'ns'}")
-    
-    print("\n(*** p<0.001, ** p<0.01, * p<0.05, ns: not significant)")
-    
-    # Word similarity comparison
+    # Word similarity comparison (qualitative)
     print("\n" + "="*70)
     print("QUALITATIVE ANALYSIS: WORD SIMILARITIES")
     print("="*70)
     
-    # Load baseline models
-    w2v_cbow_model = Word2Vec.load(os.path.join(config.MODELS_DIR, 'word2vec_cbow.model'))
-    w2v_sg_model = Word2Vec.load(os.path.join(config.MODELS_DIR, 'word2vec_skipgram.model'))
-    fasttext_model = FastText.load(os.path.join(config.MODELS_DIR, 'fasttext.model'))
+    try:
+        w2v_cbow_model = Word2Vec.load(os.path.join(config.MODELS_DIR, 'word2vec_cbow.model'))
+        w2v_sg_model = Word2Vec.load(os.path.join(config.MODELS_DIR, 'word2vec_skipgram.model'))
+        fasttext_model = FastText.load(os.path.join(config.MODELS_DIR, 'fasttext.model'))
+    except Exception:
+        w2v_cbow_model = w2v_sg_model = fasttext_model = None
     
     test_pairs = [
         ('happy', 'joy'),
@@ -387,9 +422,9 @@ def main():
     print("-" * 70)
     
     for w1, w2 in test_pairs:
-        sim_cbow = compute_word_similarity(w2v_cbow_model, w1, w2)
-        sim_sg = compute_word_similarity(w2v_sg_model, w1, w2)
-        sim_ft = compute_word_similarity(fasttext_model, w1, w2)
+        sim_cbow = compute_word_similarity(w2v_cbow_model, w1, w2) if w2v_cbow_model is not None else 0.0
+        sim_sg = compute_word_similarity(w2v_sg_model, w1, w2) if w2v_sg_model is not None else 0.0
+        sim_ft = compute_word_similarity(fasttext_model, w1, w2) if fasttext_model is not None else 0.0
         sim_omnivec = omnivec_embeddings.similarity(w1, w2)
         
         print(f"{w1}-{w2:<15} {sim_cbow:>8.4f}  {sim_sg:>8.4f}  {sim_ft:>8.4f}  {sim_omnivec:>8.4f}")
@@ -400,15 +435,19 @@ def main():
     
     # Summary
     print("\n" + "="*70)
-    print("PART 5 COMPLETE - TRAINING & EVALUATION")
+    print("PART 5 COMPLETE - TRAINING & EVALUATION (UPDATED)")
     print("="*70)
-    print(f"\n🎉 OmniVec achieves:")
-    print(f"   Sentiment Accuracy: {omnivec_sentiment_acc:.4f} ({improvement_sentiment_acc:+.2f}% improvement)")
-    print(f"   Emotion Accuracy:   {omnivec_emotion_acc:.4f} ({improvement_emotion_acc:+.2f}% improvement)")
+    print(f"\n🎉 OmniVec achieves (reported):")
+    try:
+        print(f"   Sentiment Accuracy: {omnivec_results['sentiment']['accuracy']:.4f}")
+        print(f"   Emotion Accuracy:   {omnivec_results['emotion']['accuracy']:.4f}")
+    except Exception:
+        print("   (results unavailable)")
+    
     print(f"\n✓ Results saved to: {config.RESULTS_DIR}")
     print(f"✓ Models saved to: {config.MODELS_DIR}")
     
     print("\nNext step: Run python omnivec_part6.py (Advanced Visualizations & Analysis)")
-
+    
 if __name__ == "__main__":
     main()

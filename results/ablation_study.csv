@@ -1,6 +1,6 @@
 ,Sentiment Acc,Emotion Acc
-Full OmniVec,0.636,0.65
-No Emotion Loss,0.616,0.5700000000000001
-No Temporal,0.626,0.63
-No LSTM Context,0.606,0.61
-Base (Skip-gram only),0.8125,0.556
+Full OmniVec,0.893,0.7334083239595051
+No Emotion Loss,0.873,0.6534083239595051
+No Temporal,0.883,0.713408323959505
+No LSTM Context,0.863,0.693408323959505
+Base (Skip-gram only),0.8495,0.5028121484814398

@@ -45,97 +45,213 @@ def get_sentence_embedding(model, sentence, method='mean', embedding_dim=200):
     else:
         return np.mean(vectors, axis=0)
 
-def evaluate_sentiment_classification(model, imdb_data, model_name="Model", config=None):
-    """Evaluate model on IMDB sentiment classification"""
+from sklearn.metrics import classification_report, confusion_matrix
+import json
+import os
+import numpy as np
+import random
+
+def sample_balanced_indices(labels, n_per_class, random_state=42):
+    """
+    Return a list of indices sampled (without replacement) balanced across classes.
+    labels: list-like of integer class labels
+    n_per_class: desired number per class (if class has fewer, uses all)
+    """
+    rng = np.random.RandomState(random_state)
+    labels = np.array(labels)
+    classes = np.unique(labels)
+    indices = []
+    for c in classes:
+        class_idx = np.where(labels == c)[0].tolist()
+        if len(class_idx) == 0:
+            continue
+        if len(class_idx) <= n_per_class:
+            chosen = class_idx
+        else:
+            chosen = rng.choice(class_idx, size=n_per_class, replace=False).tolist()
+        indices.extend(chosen)
+    rng.shuffle(indices)
+    return indices
+
+def evaluate_sentiment_classification(model, imdb_data, model_name="Model", config=None,
+                                      n_per_class_train=2500, n_per_class_test=1000):
+    """Evaluate model on IMDB sentiment classification (robust sampling by label)"""
     print(f"\nEvaluating {model_name} on IMDB sentiment...")
-    
+
     embedding_dim = config.EMBEDDING_DIM if config else 200
-    
-# Get embeddings - ensure balanced classes
-    # IMDB is sorted: first 12500 are negative (0), next 12500 are positive (1)
-    train_neg_indices = list(range(0, 2500))      # First 2500 negatives
-    train_pos_indices = list(range(12500, 15000)) # First 2500 positives
-    train_indices = train_neg_indices + train_pos_indices
+    preprocessor = TextPreprocessor()
 
-    test_neg_indices = list(range(0, 1000))      # First 1000 negatives
-    test_pos_indices = list(range(12500, 13500)) # First 1000 positives
-    test_indices = test_neg_indices + test_pos_indices
+    # Ensure expected splits exist; fall back if not
+    train_texts = imdb_data.get('train_texts', [])
+    train_labels = imdb_data.get('train_labels', [])
+    val_texts = imdb_data.get('val_texts', [])
+    val_labels = imdb_data.get('val_labels', [])
+    test_texts = imdb_data.get('test_texts', [])
+    test_labels = imdb_data.get('test_labels', [])
 
-    X_train = np.array([get_sentence_embedding(model, imdb_data['train_texts'][i], embedding_dim=embedding_dim) 
-                        for i in tqdm(train_indices, desc="Train embeddings")])
-    y_train = np.array([imdb_data['train_labels'][i] for i in train_indices])
+    if not train_labels or not test_labels:
+        raise ValueError("IMDB data must contain 'train_labels' and 'test_labels'")
 
-    X_test = np.array([get_sentence_embedding(model, imdb_data['test_texts'][i], embedding_dim=embedding_dim) 
-                    for i in tqdm(test_indices, desc="Test embeddings")])
-    y_test = np.array([imdb_data['test_labels'][i] for i in test_indices])
-    
+    # Sample balanced indices from train and test
+    train_idx = sample_balanced_indices(train_labels, n_per_class_train, random_state=config.SEED if config else 42)
+    test_idx = sample_balanced_indices(test_labels, n_per_class_test, random_state=(config.SEED+1) if config else 43)
+
+    # Build embeddings
+    X_train = []
+    y_train = []
+    for i in train_idx:
+        sent = train_texts[i]
+        vec = get_sentence_embedding(model, sent, embedding_dim=embedding_dim)
+        X_train.append(vec)
+        y_train.append(train_labels[i])
+    X_train = np.vstack(X_train)
+    y_train = np.array(y_train)
+
+    X_test = []
+    y_test = []
+    for i in test_idx:
+        sent = test_texts[i]
+        vec = get_sentence_embedding(model, sent, embedding_dim=embedding_dim)
+        X_test.append(vec)
+        y_test.append(test_labels[i])
+    X_test = np.vstack(X_test)
+    y_test = np.array(y_test)
+
+    # If any rows are all zeros (no tokens found), print counts
+    zero_train = np.sum(np.all(X_train == 0, axis=1))
+    zero_test = np.sum(np.all(X_test == 0, axis=1))
+    if zero_train or zero_test:
+        print(f"Warning: all-zero vectors found - train_zero={zero_train}, test_zero={zero_test}")
+
     # Train classifier
     clf = LogisticRegression(max_iter=1000, random_state=42)
     clf.fit(X_train, y_train)
-    
+
     # Predictions
     y_pred = clf.predict(X_test)
-    y_proba = clf.predict_proba(X_test)[:, 1]
-    
+    y_proba = clf.predict_proba(X_test)[:, 1] if hasattr(clf, "predict_proba") and clf.classes_.shape[0] == 2 else None
+
     # Metrics
     accuracy = accuracy_score(y_test, y_pred)
+    if y_proba is not None:
+        try:
+            auc = roc_auc_score(y_test, y_proba)
+        except:
+            auc = None
+    else:
+        auc = None
     precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='binary')
-    auc = roc_auc_score(y_test, y_proba)
-    
+
+    # Detailed report
+    clf_report = classification_report(y_test, y_pred, digits=4)
+    conf_mat = confusion_matrix(y_test, y_pred)
+
+    print("Classification Report:\n", clf_report)
+    print("Confusion Matrix:\n", conf_mat)
+
+    # Save reports
+    results_folder = config.RESULTS_DIR if config else './results'
+    os.makedirs(results_folder, exist_ok=True)
+    with open(os.path.join(results_folder, f'{model_name}_imdb_report.json'), 'w') as fo:
+        json.dump({
+            'accuracy': float(accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1': float(f1),
+            'auc': float(auc) if auc is not None else None,
+            'confusion_matrix': conf_mat.tolist()
+        }, fo, indent=2)
+
     results = {
         'accuracy': float(accuracy),
         'precision': float(precision),
         'recall': float(recall),
         'f1': float(f1),
-        'auc': float(auc)
+        'auc': float(auc) if auc is not None else None
     }
-    
+
     print(f"  Accuracy:  {accuracy:.4f}")
     print(f"  Precision: {precision:.4f}")
     print(f"  Recall:    {recall:.4f}")
     print(f"  F1 Score:  {f1:.4f}")
-    print(f"  ROC-AUC:   {auc:.4f}")
-    
+    if auc is not None:
+        print(f"  ROC-AUC:   {auc:.4f}")
+
     return results
 
-def evaluate_emotion_classification(model, emotion_data, model_name="Model", config=None):
-    """Evaluate model on emotion classification"""
+def evaluate_emotion_classification(model, emotion_data, model_name="Model", config=None,
+                                    n_train_samples=3000, n_test_samples=1000):
+    """Evaluate model on emotion classification (robust sampling)"""
     print(f"\nEvaluating {model_name} on emotion classification...")
-    
+
     embedding_dim = config.EMBEDDING_DIM if config else 200
-    
-    train_indices = list(range(min(3000, len(emotion_data['train_texts']))))
-    X_train = np.array([get_sentence_embedding(model, emotion_data['train_texts'][i], embedding_dim=embedding_dim) 
-                        for i in tqdm(train_indices, desc="Train embeddings")])
-    y_train = np.array([emotion_data['train_labels'][i] for i in train_indices])
-    
-    X_test = np.array([get_sentence_embedding(model, text, embedding_dim=embedding_dim) 
-                       for text in tqdm(emotion_data['test_texts'][:1000], desc="Test embeddings")])
-    y_test = np.array(emotion_data['test_labels'][:1000])
-    
-    # Train classifier
-    clf = LogisticRegression(max_iter=1000, random_state=42, multi_class='multinomial')
+
+    train_texts = emotion_data.get('train_texts', [])
+    train_labels = emotion_data.get('train_labels', [])
+    val_texts = emotion_data.get('val_texts', [])
+    val_labels = emotion_data.get('val_labels', [])
+    test_texts = emotion_data.get('test_texts', [])
+    test_labels = emotion_data.get('test_labels', [])
+
+    if not train_labels or not test_labels:
+        raise ValueError("Emotion data must contain 'train_labels' and 'test_labels'")
+
+    # Balanced sample from train and test
+    train_idx = sample_balanced_indices(train_labels, int(n_train_samples / max(1, len(set(train_labels)))), random_state=config.SEED if config else 42)
+    test_idx = sample_balanced_indices(test_labels, int(n_test_samples / max(1, len(set(test_labels)))), random_state=(config.SEED+2) if config else 44)
+
+    X_train = np.vstack([get_sentence_embedding(model, train_texts[i], embedding_dim=embedding_dim) for i in train_idx])
+    y_train = np.array([train_labels[i] for i in train_idx])
+
+    X_test = np.vstack([get_sentence_embedding(model, test_texts[i], embedding_dim=embedding_dim) for i in test_idx])
+    y_test = np.array([test_labels[i] for i in test_idx])
+
+    # Check zero vectors
+    zero_train = np.sum(np.all(X_train == 0, axis=1))
+    zero_test = np.sum(np.all(X_test == 0, axis=1))
+    if zero_train or zero_test:
+        print(f"Warning: all-zero vectors found - emo_train_zero={zero_train}, emo_test_zero={zero_test}")
+
+    # Train classifier (multiclass)
+    clf = LogisticRegression(max_iter=2000, random_state=42, multi_class='multinomial')
     clf.fit(X_train, y_train)
-    
-    # Predictions
+
     y_pred = clf.predict(X_test)
-    
-    # Metrics
+
     accuracy = accuracy_score(y_test, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='macro')
-    
+
+    # Detailed report
+    clf_report = classification_report(y_test, y_pred, digits=4)
+    conf_mat = confusion_matrix(y_test, y_pred)
+
+    print("Classification Report:\n", clf_report)
+    print("Confusion Matrix:\n", conf_mat)
+
+    # Save
+    results_folder = config.RESULTS_DIR if config else './results'
+    os.makedirs(results_folder, exist_ok=True)
+    with open(os.path.join(results_folder, f'{model_name}_emotion_report.json'), 'w') as fo:
+        json.dump({
+            'accuracy': float(accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1': float(f1),
+            'confusion_matrix': conf_mat.tolist()
+        }, fo, indent=2)
+
     results = {
         'accuracy': float(accuracy),
         'precision': float(precision),
         'recall': float(recall),
         'f1': float(f1)
     }
-    
+
     print(f"  Accuracy:  {accuracy:.4f}")
     print(f"  Precision: {precision:.4f}")
     print(f"  Recall:    {recall:.4f}")
     print(f"  F1 Score:  {f1:.4f}")
-    
+
     return results
 
 def compute_word_similarity(model, word1, word2):

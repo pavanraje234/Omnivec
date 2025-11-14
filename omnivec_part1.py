@@ -72,11 +72,11 @@ class OmniVecConfig:
     
     OMNIVEC_EPOCHS = 15
     BATCH_SIZE = 128
-    LEARNING_RATE = 0.001
+    LEARNING_RATE = 0.003
     
     # Loss weights
-    ALPHA_EMOTION = 0.3      # Emotion loss weight
-    ALPHA_TEMPORAL = 0.2     # Temporal loss weight
+    ALPHA_EMOTION = 0.15      # Emotion loss weight
+    ALPHA_TEMPORAL = 0.05     # Temporal loss weight
     ALPHA_MULTIMODAL = 0.25  # Multimodal loss weight
     ALPHA_CAUSAL = 0.15      # Causality loss weight
     ALPHA_BASE = 1.0         # Base embedding loss weight
@@ -196,7 +196,7 @@ def main():
     print(f"  - Seed: {config.SEED}")
     print(f"  - Data directory: {config.DATA_DIR}")
     
-    # Set plotting style
+    # Set plotting stylee
     set_plotting_style()
     print("✓ Plotting style configured")
     

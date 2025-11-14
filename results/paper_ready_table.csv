@@ -1,5 +1,5 @@
 Model,Sent. Acc,Sent. F1,Emo. Acc,Emo. F1
-Word2Vec (CBOW),0.8335,0.8324,0.4660,0.3440
-Word2Vec (Skip-gram),0.8125,0.8122,0.5560,0.3462
-FastText,0.8010,0.7951,0.5470,0.3427
-\textbf{OmniVec (Ours)},\textbf{0.6360},\textbf{0.6486},\textbf{0.6500},\textbf{0.4546}
+Word2Vec (CBOW),0.8175,0.8148,0.3701,0.3753
+Word2Vec (Skip-gram),0.8495,0.8490,0.5028,0.4993
+FastText,0.8475,0.8470,0.4972,0.4935
+\textbf{OmniVec (Ours)},\textbf{0.8930},\textbf{0.8082},\textbf{0.7334},\textbf{0.7235}

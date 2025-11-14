@@ -100,42 +100,52 @@ class TextPreprocessor:
         """Simple whitespace tokenization"""
         return text.split()
 
-def load_imdb_data(config):
-    """Load and preprocess IMDB movie reviews"""
+def load_imdb_data(config, val_size=0.1, random_state=None):
+    """Load and preprocess IMDB movie reviews with validation split"""
     print("\n" + "="*70)
-    print("Loading IMDB Dataset")
+    print("Loading IMDB Dataset (with validation split)")
     print("="*70)
     
     preprocessor = TextPreprocessor()
+    random_state = random_state or config.SEED
     
     try:
         dataset = load_dataset('imdb')
         
-        # Process training data
-        train_texts = []
-        train_labels = []
-        
+        texts = []
+        labels = []
         for item in tqdm(dataset['train'], desc="Processing IMDB train"):
             text = preprocessor.clean_text(item['text'])
-            if len(text) > 10:  # Filter very short texts
-                train_texts.append(text)
-                train_labels.append(item['label'])
+            if len(text) > 10:
+                texts.append(text)
+                labels.append(int(item['label']))
         
-        # Process test data
+        # Stratified split into train/val
+        from sklearn.model_selection import train_test_split
+        train_texts, val_texts, train_labels, val_labels = train_test_split(
+            texts, labels, test_size=val_size, random_state=random_state, stratify=labels
+        )
+        
+        # Process official test split
         test_texts = []
         test_labels = []
-        
         for item in tqdm(dataset['test'], desc="Processing IMDB test"):
             text = preprocessor.clean_text(item['text'])
             if len(text) > 10:
                 test_texts.append(text)
-                test_labels.append(item['label'])
+                test_labels.append(int(item['label']))
         
-        print(f"✓ IMDB loaded: {len(train_texts)} train, {len(test_texts)} test samples")
+        print(f"✓ IMDB loaded: {len(train_texts)} train, {len(val_texts)} val, {len(test_texts)} test samples")
+        from collections import Counter
+        print("Train label counts:", Counter(train_labels))
+        print("Val   label counts:", Counter(val_labels))
+        print("Test  label counts:", Counter(test_labels))
         
         return {
             'train_texts': train_texts,
             'train_labels': train_labels,
+            'val_texts': val_texts,
+            'val_labels': val_labels,
             'test_texts': test_texts,
             'test_labels': test_labels
         }
@@ -143,46 +153,75 @@ def load_imdb_data(config):
         print(f"Error loading IMDB: {e}")
         return None
 
-def load_emotion_data(config):
-    """Load emotion classification dataset"""
+from sklearn.model_selection import train_test_split
+
+def load_emotion_data(config, val_size=0.1, random_state=None):
+    """Load emotion classification dataset and return integer labels + validation split"""
     print("\n" + "="*70)
-    print("Loading Emotion Dataset")
+    print("Loading Emotion Dataset (with integer labels and val split)")
     print("="*70)
     
     preprocessor = TextPreprocessor()
+    random_state = random_state or config.SEED
     
     try:
         dataset = load_dataset('emotion')
+        # HuggingFace emotion mapping (0..5) -> names
+        hf_map = {0: 'sadness', 1: 'joy', 2: 'love', 3: 'anger', 4: 'fear', 5: 'surprise'}
         
-        emotion_map = {0: 'sadness', 1: 'joy', 2: 'love', 
-                      3: 'anger', 4: 'fear', 5: 'surprise'}
+        # Choose emotion list from config if it matches; otherwise derive from hf_map
+        if hasattr(config, 'EMOTIONS') and set(config.EMOTIONS).issuperset(set(hf_map.values())):
+            emotions_list = list(hf_map.values())
+        else:
+            emotions_list = list(hf_map.values())
         
-        train_texts = []
-        train_labels = []
+        name_to_idx = {name: idx for idx, name in enumerate(emotions_list)}
         
+        texts = []
+        labels = []
         for item in tqdm(dataset['train'], desc="Processing emotion train"):
             text = preprocessor.clean_text(item['text'])
-            if len(text) > 5:
-                train_texts.append(text)
-                train_labels.append(emotion_map[item['label']])
+            if len(text) > 2:
+                lbl_name = hf_map[item['label']]
+                if lbl_name in name_to_idx:
+                    texts.append(text)
+                    labels.append(name_to_idx[lbl_name])
         
+        # Create stratified validation split from train
+        train_texts, val_texts, train_labels, val_labels = train_test_split(
+            texts, labels, test_size=val_size, random_state=random_state, stratify=labels
+        )
+        
+        # Process test data similarly (map to indices)
         test_texts = []
         test_labels = []
-        
         for item in tqdm(dataset['test'], desc="Processing emotion test"):
             text = preprocessor.clean_text(item['text'])
-            if len(text) > 5:
-                test_texts.append(text)
-                test_labels.append(emotion_map[item['label']])
+            if len(text) > 2:
+                lbl_name = hf_map[item['label']]
+                if lbl_name in name_to_idx:
+                    test_texts.append(text)
+                    test_labels.append(name_to_idx[lbl_name])
         
-        print(f"✓ Emotion dataset loaded: {len(train_texts)} train, {len(test_texts)} test samples")
+        print(f"✓ Emotion dataset loaded: {len(train_texts)} train, {len(val_texts)} val, {len(test_texts)} test samples")
+        
+        # Save label map as name->index and index->name
+        label_map = {'name_to_idx': name_to_idx, 'idx_to_name': {v:k for k,v in name_to_idx.items()}}
+        
+        # Print class distribution
+        from collections import Counter
+        print("Train label counts:", Counter(train_labels))
+        print("Val   label counts:", Counter(val_labels))
+        print("Test  label counts:", Counter(test_labels))
         
         return {
             'train_texts': train_texts,
             'train_labels': train_labels,
+            'val_texts': val_texts,
+            'val_labels': val_labels,
             'test_texts': test_texts,
             'test_labels': test_labels,
-            'label_map': emotion_map
+            'label_map': label_map
         }
     except Exception as e:
         print(f"Error loading emotion dataset: {e}")
@@ -306,34 +345,49 @@ def create_causality_data():
     }
 
 def build_unified_corpus(imdb_data, emotion_data, temporal_corpus, causality_data):
-    """Combine all text data into a unified corpus"""
+    """Combine all text data into a unified corpus and preserve metadata"""
     print("\n" + "="*70)
-    print("Building Unified Corpus")
+    print("Building Unified Corpus (with metadata)")
     print("="*70)
     
     preprocessor = TextPreprocessor()
     all_sentences = []
+    metadata = []  # list of tuples (source, split, original_label_or_None)
     
-    # Add IMDB
+    # Add IMDB (train + val)
     if imdb_data:
-        all_sentences.extend(imdb_data['train_texts'])
-        print(f"  Added {len(imdb_data['train_texts'])} IMDB sentences")
+        for txt, lbl in zip(imdb_data.get('train_texts', []), imdb_data.get('train_labels', [])):
+            all_sentences.append(txt)
+            metadata.append(('imdb', 'train', int(lbl)))
+        for txt, lbl in zip(imdb_data.get('val_texts', []), imdb_data.get('val_labels', [])):
+            all_sentences.append(txt)
+            metadata.append(('imdb', 'val', int(lbl)))
+        print(f"  Added {len(imdb_data.get('train_texts', []))} IMDB train and {len(imdb_data.get('val_texts', []))} val sentences")
     
-    # Add emotion
+    # Add emotion (train + val)
     if emotion_data:
-        all_sentences.extend(emotion_data['train_texts'])
-        print(f"  Added {len(emotion_data['train_texts'])} emotion sentences")
+        for txt, lbl in zip(emotion_data.get('train_texts', []), emotion_data.get('train_labels', [])):
+            all_sentences.append(txt)
+            metadata.append(('emotion', 'train', int(lbl)))
+        for txt, lbl in zip(emotion_data.get('val_texts', []), emotion_data.get('val_labels', [])):
+            all_sentences.append(txt)
+            metadata.append(('emotion', 'val', int(lbl)))
+        print(f"  Added {len(emotion_data.get('train_texts', []))} emotion train and {len(emotion_data.get('val_texts', []))} val sentences")
     
-    # Add temporal
+    # Add temporal (no labels) but keep provenance
     for period, sentences in temporal_corpus.items():
-        all_sentences.extend(sentences)
+        for sent in sentences:
+            all_sentences.append(sent)
+            metadata.append(('temporal', period, None))
     print(f"  Added {sum(len(s) for s in temporal_corpus.values())} temporal sentences")
     
-    # Add causality
-    all_sentences.extend(causality_data['sentences'])
+    # Add causality (no labels, but set source)
+    for sent in causality_data['sentences']:
+        all_sentences.append(sent)
+        metadata.append(('causal', 'synthetic', None))
     print(f"  Added {len(causality_data['sentences'])} causality sentences")
     
-    # Tokenize all sentences
+    # Tokenize all sentences using the project's preprocessor
     tokenized_corpus = [preprocessor.tokenize(sent) for sent in all_sentences]
     
     # Build vocabulary
@@ -342,7 +396,6 @@ def build_unified_corpus(imdb_data, emotion_data, temporal_corpus, causality_dat
         vocab_counter.update(tokens)
     
     vocab_size = len(vocab_counter)
-    
     print(f"\n✓ Unified corpus created:")
     print(f"  - Total sentences: {len(all_sentences)}")
     print(f"  - Vocabulary size: {vocab_size}")
@@ -352,7 +405,8 @@ def build_unified_corpus(imdb_data, emotion_data, temporal_corpus, causality_dat
         'sentences': all_sentences,
         'tokenized': tokenized_corpus,
         'vocab': vocab_counter,
-        'vocab_size': vocab_size
+        'vocab_size': vocab_size,
+        'metadata': metadata
     }
 
 def main():
